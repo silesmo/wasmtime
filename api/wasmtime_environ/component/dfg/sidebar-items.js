@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CoreDef","Export","Instance","SideEffect"],"struct":["AdapterId","AdapterModuleId","AlwaysTrapId","CanonicalOptions","ComponentDfg","CoreExport","InstanceId","Intern","LowerImport","LowerImportId","MemoryId","PostReturnId","ReallocId","Resource","Transcoder","TranscoderId"]};

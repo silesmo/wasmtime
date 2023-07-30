@@ -9,6 +9,7 @@ use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
 mod kw {
     syn::custom_keyword!(record);
+    syn::custom_keyword!(resource);
     syn::custom_keyword!(variant);
     syn::custom_keyword!(flags);
     syn::custom_keyword!(name);
@@ -34,6 +35,7 @@ impl fmt::Display for VariantStyle {
 #[derive(Debug, Copy, Clone)]
 enum Style {
     Record,
+    //Resource,
     Variant(VariantStyle),
 }
 
@@ -64,7 +66,12 @@ impl Parse for Style {
         if lookahead.peek(kw::record) {
             input.parse::<kw::record>()?;
             Ok(Style::Record)
-        } else if lookahead.peek(kw::variant) {
+        }
+        /*else if lookahead.peek(kw::resource) {
+            input.parse::<kw::resource>()?;
+            Ok(Style::Resource)
+        } */
+        else if lookahead.peek(kw::variant) {
             input.parse::<kw::variant>()?;
             Ok(Style::Variant(VariantStyle::Variant))
         } else if lookahead.peek(Token![enum]) {
@@ -147,13 +154,40 @@ pub trait Expander {
 pub fn expand(expander: &dyn Expander, input: &DeriveInput) -> Result<TokenStream> {
     match find_style(input)? {
         Style::Record => expand_record(expander, input),
+        //Style::Resource => expand_resource(expander, input),
         Style::Variant(style) => expand_variant(expander, input, style),
+    }
+}
+
+fn expand_resource(expander: &dyn Expander, input: &DeriveInput) -> Result<TokenStream> {
+    let name = &input.ident;
+    //syn::TraitItem::Const(TraitItemConst{})
+    let body = if let Data::Struct(body) = &input.data {
+        body
+    } else {
+        return Err(Error::new(
+            name.span(),
+            "`resource` component types can only be derived for Rust `struct`s",
+        ));
+    };
+
+    match &body.fields {
+        syn::Fields::Named(fields) => expander.expand_record(
+            &input.ident,
+            &input.generics,
+            &fields.named.iter().collect::<Vec<_>>(),
+        ),
+
+        syn::Fields::Unnamed(_) | syn::Fields::Unit => Err(Error::new(
+            name.span(),
+            "`resource` component types can only be derived for `struct`s with named fields",
+        )),
     }
 }
 
 fn expand_record(expander: &dyn Expander, input: &DeriveInput) -> Result<TokenStream> {
     let name = &input.ident;
-
+    //syn::TraitItem::Const(TraitItemConst{})
     let body = if let Data::Struct(body) = &input.data {
         body
     } else {

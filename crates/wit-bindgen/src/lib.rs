@@ -130,7 +130,10 @@ impl Opts {
         let mut r = Wasmtime::default();
         r.sizes.fill(resolve);
         r.opts = self.clone();
-        r.generate(resolve, world)
+        let output = r.generate(resolve, world);
+        dbg!(&output);
+        std::fs::write(&format!("./test_wit_world_out.rs"), &output);
+        output
     }
 }
 
@@ -541,6 +544,18 @@ impl Wasmtime {
     }
 }
 
+//pub trait Empty2 {}
+///// A resource containing two scalar fields
+///// /// that both have the same type
+//pub trait Scalars {
+//    /// constructor
+//    fn constructor_scalars(&mut self, init: Vec<u8>) -> wasmtime::Result<Resource<Scalars>>;
+//    /// The first field, named a
+//    fn method_scalars_get_a(&mut self, self_: Resource<Scalars>) -> wasmtime::Result<u32>;
+//    /// The second field, named b
+//    fn method_scalars_get_b(&mut self, self_: Resource<Scalars>) -> wasmtime::Result<u32>;
+//}
+
 impl Wasmtime {
     fn toplevel_import_trait(&mut self, resolve: &Resolve, world: WorldId) {
         if self.import_functions.is_empty() {
@@ -681,8 +696,8 @@ impl<'a> InterfaceGenerator<'a> {
             TypeDefKind::Type(t) => self.type_alias(id, name, t, &ty.docs),
             TypeDefKind::Future(_) => todo!("generate for future"),
             TypeDefKind::Stream(_) => todo!("generate for stream"),
-            TypeDefKind::Handle(_) => todo!("#6722"),
-            TypeDefKind::Resource => todo!("#6722"),
+            TypeDefKind::Handle(h) => self.type_handle(id, name, h, &ty.docs),
+            TypeDefKind::Resource => self.type_resource(id, name, &ty.docs),
             TypeDefKind::Unknown => unreachable!(),
         }
     }
@@ -1118,6 +1133,100 @@ impl<'a> InterfaceGenerator<'a> {
         }
     }
 
+    fn type_handle(&mut self, id: TypeId, _name: &str, h: &Handle, docs: &Docs) {
+        self.rustdoc(docs);
+        dbg!(_name);
+        //self.push_str(&format!("Resource<{_name}>",))
+        //todo!("#6722")
+    }
+
+    fn type_resource(&mut self, id: TypeId, name: &str, docs: &Docs) {
+        let owner = self.resolve.types[id].owner;
+
+        //uwriteln!(self.src, "use wasmtime::component::Resource;");
+
+        self.rustdoc(docs);
+
+        // Generate the `pub trait` which represents the resource functionality for
+        // this import.
+        let camel = name.to_upper_camel_case();
+
+        //This is the resource the implementer should implement the trait for
+        uwriteln!(self.src, "pub struct {camel}Impl;");
+
+        if self.gen.opts.async_ {
+            uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
+        }
+
+        uwriteln!(self.src, "pub trait {camel} {{");
+
+        let interface = match owner {
+            TypeOwner::World(_) => {
+                todo!()
+            }
+            TypeOwner::Interface(interface) => interface,
+            TypeOwner::None => {
+                panic!("A resource must be owned by a world or interface");
+            }
+        };
+
+        let iface = &self.resolve.interfaces[interface];
+
+        for (_, func) in &iface.functions {
+            match func.kind {
+                FunctionKind::Freestanding => {
+                    // Do nothing as free standing functions can't be a part of a resource
+                }
+                FunctionKind::Method(resource)
+                | FunctionKind::Static(resource)
+                | FunctionKind::Constructor(resource) => {
+                    // Only generate the function trait signature if the function is part of this resource
+                    if id == resource {
+                        self.generate_function_trait_sig(owner, func);
+                    }
+                }
+            }
+        }
+
+        uwriteln!(self.src, "}}");
+
+        let where_clause = if self.gen.opts.async_ {
+            format!("T: Send, U: {camel} + Send")
+        } else {
+            format!("U: {camel}")
+        };
+        uwriteln!(
+            self.src,
+            "
+                pub fn add_to_linker<T, U>(
+                    linker: &mut wasmtime::component::Linker<T>,
+                    get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
+                ) -> wasmtime::Result<()>
+                    where {where_clause},
+                {{
+            "
+        );
+        uwriteln!(self.src, "let mut inst = linker.instance(\"{name}\")?;");
+        for (_, func) in &iface.functions {
+            match func.kind {
+                FunctionKind::Freestanding => {
+                    // Do nothing as freestanding functions can only be part of a resource
+                }
+                FunctionKind::Method(resource)
+                | FunctionKind::Static(resource)
+                | FunctionKind::Constructor(resource) => {
+                    if id == resource {
+                        self.generate_add_function_to_linker(owner, func, "inst");
+                    }
+                }
+            }
+        }
+        uwriteln!(self.src, "Ok(())");
+        uwriteln!(self.src, "}}");
+
+        //todo!("#6722")
+    }
+
     fn print_result_ty(&mut self, results: &Results, mode: TypeMode) {
         match results {
             Results::Named(rs) => match rs.len() {
@@ -1179,7 +1288,16 @@ impl<'a> InterfaceGenerator<'a> {
         // this import.
         uwriteln!(self.src, "pub trait Host {{");
         for (_, func) in iface.functions.iter() {
-            self.generate_function_trait_sig(owner, func);
+            match func.kind {
+                FunctionKind::Freestanding => {
+                    self.generate_function_trait_sig(owner, func);
+                }
+                FunctionKind::Method(resource)
+                | FunctionKind::Static(resource)
+                | FunctionKind::Constructor(resource) => {
+                    // Do nothing as Static functions, methods and constructors can only be part of a resource
+                }
+            }
         }
         uwriteln!(self.src, "}}");
 
@@ -1201,7 +1319,16 @@ impl<'a> InterfaceGenerator<'a> {
         );
         uwriteln!(self.src, "let mut inst = linker.instance(\"{name}\")?;");
         for (_, func) in iface.functions.iter() {
-            self.generate_add_function_to_linker(owner, func, "inst");
+            match func.kind {
+                FunctionKind::Freestanding => {
+                    self.generate_add_function_to_linker(owner, func, "inst");
+                }
+                FunctionKind::Method(resource)
+                | FunctionKind::Static(resource)
+                | FunctionKind::Constructor(resource) => {
+                    // Do nothing as Static functions, methods and constructors can only be part of a resource
+                }
+            }
         }
         uwriteln!(self.src, "Ok(())");
         uwriteln!(self.src, "}}");

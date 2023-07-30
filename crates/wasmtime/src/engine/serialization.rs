@@ -190,7 +190,7 @@ impl Metadata {
             memory_control,
             function_references,
             gc,
-
+            component_model_values,
             // Always on; we don't currently have knobs for these.
             mutable_global: _,
             saturating_float_to_int: _,

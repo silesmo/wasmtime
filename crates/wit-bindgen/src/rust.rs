@@ -92,6 +92,7 @@ pub trait RustGenerator<'a> {
                 if let Some(path) = self.path_to_interface(id) {
                     self.push_str(&path);
                     self.push_str("::");
+                    dbg!(path);
                 }
             }
             self.push_str(&name);
@@ -160,6 +161,9 @@ pub trait RustGenerator<'a> {
                 }
                 self.push_str(")");
             }
+            TypeDefKind::Resource => {
+                panic!("unsupported anonymous type reference: resource")
+            }
             TypeDefKind::Record(_) => {
                 panic!("unsupported anonymous type reference: record")
             }
@@ -184,10 +188,16 @@ pub trait RustGenerator<'a> {
                 self.print_optional_ty(stream.end.as_ref(), mode);
                 self.push_str(">");
             }
-
-            TypeDefKind::Handle(_) => todo!("#6722"),
-            TypeDefKind::Resource => todo!("#6722"),
-
+            TypeDefKind::Handle(Handle::Own(ty)) => {
+                self.push_str("wasmtime::component::Resource<");
+                self.print_tyid(*ty, mode);
+                self.push_str("Impl>");
+            }
+            TypeDefKind::Handle(Handle::Borrow(ty)) => {
+                self.push_str("wasmtime::component::Resource<");
+                self.print_tyid(*ty, mode);
+                self.push_str("Impl>");
+            }
             TypeDefKind::Type(t) => self.print_ty(t, mode),
             TypeDefKind::Unknown => unreachable!(),
         }
@@ -297,8 +307,15 @@ pub trait RustGenerator<'a> {
                         TypeDefKind::Variant(_) => out.push_str("Variant"),
                         TypeDefKind::Enum(_) => out.push_str("Enum"),
                         TypeDefKind::Union(_) => out.push_str("Union"),
-                        TypeDefKind::Handle(_) => todo!("#6722"),
-                        TypeDefKind::Resource => todo!("#6722"),
+                        TypeDefKind::Handle(Handle::Own(ty)) => {
+                            self.write_name(&Type::Id(*ty), out);
+                            out.push_str("Own");
+                        }
+                        TypeDefKind::Handle(Handle::Borrow(ty)) => {
+                            self.write_name(&Type::Id(*ty), out);
+                            out.push_str("Borrow");
+                        }
+                        TypeDefKind::Resource => out.push_str("Resource"),
                         TypeDefKind::Unknown => unreachable!(),
                     },
                 }

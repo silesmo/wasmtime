@@ -17,7 +17,7 @@ impl From<anyhow::Error> for streams::Error {
         tracing::trace!(
             "turning anyhow::Error in the streams interface into the empty error result: {error:?}"
         );
-        StreamError {}.into()
+        StreamError { dummy: 0 }.into()
     }
 }
 
@@ -27,7 +27,7 @@ impl From<TableError> for streams::Error {
             TableError::Full => streams::Error::trap(anyhow!(error)),
             TableError::NotPresent | TableError::WrongType => {
                 // wit definition needs to define a badf-equiv variant:
-                StreamError {}.into()
+                StreamError { dummy: 0 }.into()
             }
         }
     }
@@ -412,7 +412,7 @@ pub mod sync {
             stream: OutputStream,
             bytes: Vec<u8>,
         ) -> Result<(u64, streams::StreamStatus), streams::Error> {
-            in_tokio(async { AsyncHost::write(self, stream, bytes).await })
+            in_tokio(async { AsyncHost::blocking_write(self, stream, bytes).await })
                 .map(|(a, b)| (a, b.into()))
                 .map_err(streams::Error::from)
         }

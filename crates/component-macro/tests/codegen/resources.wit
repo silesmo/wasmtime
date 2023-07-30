@@ -1,0 +1,48 @@
+package foo:foo
+
+interface resources {
+  //resource empty {}
+  
+  //empty-arg: func(x: own<empty>)
+  //empty-result: func() -> own<empty>
+    //
+  /// A resource containing two scalar fields
+  /// that both have the same type
+  resource scalars {
+      /// constructor
+      constructor(init: list<u8>)
+      /// The first field, named a
+      get-a: static func() -> u32
+      /// The second field, named b
+      get-b: func() -> u32
+
+  }
+
+  scalar-arg: func(x: borrow<scalars>) -> ()
+    //scalar-result: func() -> scalars
+//
+  ///// A resource that is really just flags
+  ///// All of the fields are bool
+  //resource really-flags {
+  //    get-a: func() -> bool
+  //    get-b: func() -> bool
+  //}
+//
+  //flags-arg: func(x: own<really-flags>) -> ()
+  //flags-result: func() -> borrow<really-flags>
+//
+  //resource aggregates {
+  //    get-scalars: func() -> own<scalars>
+  //    get-really-flags: func() -> borrow<really-flags>
+  //    get-empty: func() -> own<empty>
+  //    get-string: func() -> string
+  //}
+//
+  //aggregate-arg: func(x: aggregates) -> ()
+  //aggregate-result: func() -> aggregates
+}
+
+world the-world {
+  import resources
+  export resources
+}

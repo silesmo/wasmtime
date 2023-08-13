@@ -1,8 +1,3 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-};
-
 use syn::{parse_macro_input, DeriveInput, Error};
 
 mod bindgen;
@@ -47,17 +42,7 @@ pub fn flags(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 
 #[proc_macro]
 pub fn bindgen(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    //let in2 = input.clone();
-    let tokens: proc_macro::TokenStream =
-        bindgen::expand(&parse_macro_input!(input as bindgen::Config))
-            .unwrap_or_else(Error::into_compile_error)
-            .into();
-    //let mut hasher = DefaultHasher::new();
-    //let name = in2.to_string();
-    //name.hash(&mut hasher);
-
-    //let name = hasher.finish();
-    //std::fs::write(&format!("./testwit{name}.rs"), format!("{}", tokens));
-
-    tokens
+    bindgen::expand(&parse_macro_input!(input as bindgen::Config))
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
 }

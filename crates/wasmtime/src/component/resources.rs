@@ -484,6 +484,27 @@ pub struct ResourceAny {
     own_state: Option<OwnState>,
 }
 
+/// Trait used for ergonomically converting to a ResourceAny handle.
+pub trait ToHandle {
+    /// Returns a [`ResourceAny`] handle.
+    fn to_handle(&self) -> ResourceAny;
+}
+
+/// Trait used by the generated host implementation for resources
+pub trait ResourceTable<T> {
+    /// Get's a resource with the corresponding handle.
+    fn get_resource(&self, handle: Resource<T>) -> &T;
+
+    /// Get's a resource as mutable with the corresponding handle.
+    fn get_resource_mut(&mut self, handle: Resource<T>) -> &mut T;
+
+    /// Used to create a new resource handle for a host representation of a resource.
+    fn new_resource(&mut self, resource: T) -> Resource<T>;
+
+    /// Drops the resource handle.
+    fn drop_resource(&mut self, rep: u32);
+}
+
 #[derive(Copy, Clone)]
 struct OwnState {
     store: StoreId,

@@ -21,7 +21,7 @@ pub use self::func::{
 };
 pub use self::instance::{ExportInstance, Exports, Instance, InstancePre};
 pub use self::linker::{Linker, LinkerInstance};
-pub use self::resources::{Resource, ResourceAny};
+pub use self::resources::{Resource, ResourceAny, ResourceTable, ToHandle};
 pub use self::types::{ResourceType, Type};
 pub use self::values::{
     Enum, Flags, List, OptionVal, Record, ResultVal, Tuple, Union, Val, Variant,

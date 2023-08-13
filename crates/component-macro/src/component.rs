@@ -9,7 +9,6 @@ use wasmtime_component_util::{DiscriminantSize, FlagsSize};
 
 mod kw {
     syn::custom_keyword!(record);
-    syn::custom_keyword!(resource);
     syn::custom_keyword!(variant);
     syn::custom_keyword!(flags);
     syn::custom_keyword!(name);
@@ -156,32 +155,6 @@ pub fn expand(expander: &dyn Expander, input: &DeriveInput) -> Result<TokenStrea
         Style::Record => expand_record(expander, input),
         //Style::Resource => expand_resource(expander, input),
         Style::Variant(style) => expand_variant(expander, input, style),
-    }
-}
-
-fn expand_resource(expander: &dyn Expander, input: &DeriveInput) -> Result<TokenStream> {
-    let name = &input.ident;
-    //syn::TraitItem::Const(TraitItemConst{})
-    let body = if let Data::Struct(body) = &input.data {
-        body
-    } else {
-        return Err(Error::new(
-            name.span(),
-            "`resource` component types can only be derived for Rust `struct`s",
-        ));
-    };
-
-    match &body.fields {
-        syn::Fields::Named(fields) => expander.expand_record(
-            &input.ident,
-            &input.generics,
-            &fields.named.iter().collect::<Vec<_>>(),
-        ),
-
-        syn::Fields::Unnamed(_) | syn::Fields::Unit => Err(Error::new(
-            name.span(),
-            "`resource` component types can only be derived for `struct`s with named fields",
-        )),
     }
 }
 

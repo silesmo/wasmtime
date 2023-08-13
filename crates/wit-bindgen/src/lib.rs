@@ -106,6 +106,9 @@ pub struct Opts {
     /// Remapping of interface names to rust module names.
     /// TODO: is there a better type to use for the value of this map?
     pub with: HashMap<String, String>,
+
+    /// Resource Mappings
+    pub resources: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -130,10 +133,7 @@ impl Opts {
         let mut r = Wasmtime::default();
         r.sizes.fill(resolve);
         r.opts = self.clone();
-        let output = r.generate(resolve, world);
-        dbg!(&output);
-        std::fs::write(&format!("./test_wit_world_out.rs"), &output);
-        output
+        r.generate(resolve, world)
     }
 }
 
@@ -283,11 +283,18 @@ impl Wasmtime {
                 let camel = to_rust_upper_camel_case(iface_name);
                 uwriteln!(gen.src, "pub struct {camel} {{");
                 for (_, func) in iface.functions.iter() {
-                    uwriteln!(
-                        gen.src,
-                        "{}: wasmtime::component::Func,",
-                        func.name.to_snake_case()
-                    );
+                    match func.kind {
+                        FunctionKind::Freestanding => {
+                            uwriteln!(
+                                gen.src,
+                                "{}: wasmtime::component::Func,",
+                                func.name.to_snake_case()
+                            );
+                        }
+                        _ => {
+                            // Only generate functions that belongs to the interface and not it's containing resources
+                        }
+                    }
                 }
                 uwriteln!(gen.src, "}}");
 
@@ -302,9 +309,16 @@ impl Wasmtime {
                 );
                 let mut fields = Vec::new();
                 for (_, func) in iface.functions.iter() {
-                    let (name, getter) = gen.extract_typed_function(func);
-                    uwriteln!(gen.src, "let {name} = {getter};");
-                    fields.push(name);
+                    match func.kind {
+                        FunctionKind::Freestanding => {
+                            let (name, getter) = gen.extract_typed_function(func);
+                            uwriteln!(gen.src, "let {name} = {getter};");
+                            fields.push(name);
+                        }
+                        _ => {
+                            // Only generate functions that belongs to the interface and not it's containing resources
+                        }
+                    }
                 }
                 uwriteln!(gen.src, "Ok({camel} {{");
                 for name in fields {
@@ -313,7 +327,14 @@ impl Wasmtime {
                 uwriteln!(gen.src, "}})");
                 uwriteln!(gen.src, "}}");
                 for (_, func) in iface.functions.iter() {
-                    gen.define_rust_guest_export(resolve, Some(name), func);
+                    match func.kind {
+                        FunctionKind::Freestanding => {
+                            gen.define_rust_guest_export(resolve, Some(name), func);
+                        }
+                        _ => {
+                            // Only generate functions that belongs to the interface and not it's containing resources
+                        }
+                    }
                 }
                 uwriteln!(gen.src, "}}");
 
@@ -544,18 +565,6 @@ impl Wasmtime {
     }
 }
 
-//pub trait Empty2 {}
-///// A resource containing two scalar fields
-///// /// that both have the same type
-//pub trait Scalars {
-//    /// constructor
-//    fn constructor_scalars(&mut self, init: Vec<u8>) -> wasmtime::Result<Resource<Scalars>>;
-//    /// The first field, named a
-//    fn method_scalars_get_a(&mut self, self_: Resource<Scalars>) -> wasmtime::Result<u32>;
-//    /// The second field, named b
-//    fn method_scalars_get_b(&mut self, self_: Resource<Scalars>) -> wasmtime::Result<u32>;
-//}
-
 impl Wasmtime {
     fn toplevel_import_trait(&mut self, resolve: &Resolve, world: WorldId) {
         if self.import_functions.is_empty() {
@@ -593,6 +602,18 @@ impl Wasmtime {
             }
         }
 
+        let maybe_resource_trait_impls = {
+            if self.opts.resources.len() > 0 {
+                let traits = self.opts.resources.iter().map(|(_wit_name, impl_name)| format!("wasmtime::component::ResourceTable<{impl_name}>"))
+                .collect::<Vec<String>>()
+                .join(" + ");
+                
+                Some(traits)
+            } else {
+                None
+            }
+        };
+
         uwrite!(
             self.src,
             "
@@ -620,12 +641,15 @@ impl Wasmtime {
             }
             self.src.push_str(&name);
         }
-        let maybe_send = if self.opts.async_ {
-            " + Send, T: Send"
-        } else {
-            ""
+
+        let maybe_send = match (self.opts.async_, maybe_resource_trait_impls) {
+            (true, None) => " + Send, T: Send".to_owned(),
+            (true, Some(resource_trait_impls)) => format!(" + Send, T: {resource_trait_impls} + Send"),
+            (false, None) => "".to_owned(),
+            (false, Some(resource_trait_impls)) => format!(", T: {resource_trait_impls}"),
         };
-        self.src.push_str(maybe_send);
+
+        self.src.push_str(&maybe_send);
         self.src.push_str(",\n{\n");
         for name in interfaces.iter() {
             uwriteln!(self.src, "{name}::add_to_linker(linker, get)?;");
@@ -1109,13 +1133,22 @@ impl<'a> InterfaceGenerator<'a> {
         let info = self.info(id);
         for (name, mode) in self.modes_of(id) {
             self.rustdoc(docs);
-            self.push_str(&format!("pub type {}", name));
-            let lt = self.lifetime_for(&info, mode);
-            self.print_generics(lt);
-            self.push_str(" = ");
-            self.print_ty(ty, mode);
-            self.push_str(";\n");
-            self.assert_type(id, &name);
+
+            let resource = self.get_resource_from_ty(ty);
+
+            if resource.is_empty() {
+                self.push_str(&format!("pub type {}", name));
+                let lt = self.lifetime_for(&info, mode);
+                self.print_generics(lt);
+                self.push_str(" = ");
+                self.print_ty(ty, mode);
+                self.push_str(";\n");
+                self.assert_type(id, &name);
+            } else {
+                self.push_str(&format!("use "));
+                self.print_ty(ty, mode);
+                self.push_str(";\n");
+            }
         }
     }
 
@@ -1135,8 +1168,8 @@ impl<'a> InterfaceGenerator<'a> {
 
     fn type_handle(&mut self, id: TypeId, _name: &str, h: &Handle, docs: &Docs) {
         self.rustdoc(docs);
-        dbg!(_name);
-        //self.push_str(&format!("Resource<{_name}>",))
+        //dbg!(_name);
+        //self.push_str(&format!("wasmtime::component::Resource<Rep{_name}>",))
         //todo!("#6722")
     }
 
@@ -1150,9 +1183,6 @@ impl<'a> InterfaceGenerator<'a> {
         // Generate the `pub trait` which represents the resource functionality for
         // this import.
         let camel = name.to_upper_camel_case();
-
-        //This is the resource the implementer should implement the trait for
-        uwriteln!(self.src, "pub struct {camel}Impl;");
 
         if self.gen.opts.async_ {
             uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
@@ -1182,7 +1212,7 @@ impl<'a> InterfaceGenerator<'a> {
                 | FunctionKind::Constructor(resource) => {
                     // Only generate the function trait signature if the function is part of this resource
                     if id == resource {
-                        self.generate_function_trait_sig(owner, func);
+                        self.generate_export_resource_function_trait_sig(owner, func);
                     }
                 }
             }
@@ -1190,39 +1220,70 @@ impl<'a> InterfaceGenerator<'a> {
 
         uwriteln!(self.src, "}}");
 
-        let where_clause = if self.gen.opts.async_ {
-            format!("T: Send, U: {camel} + Send")
-        } else {
-            format!("U: {camel}")
-        };
-        uwriteln!(
-            self.src,
-            "
-                pub fn add_to_linker<T, U>(
-                    linker: &mut wasmtime::component::Linker<T>,
-                    get: impl Fn(&mut T) -> &mut U + Send + Sync + Copy + 'static,
-                ) -> wasmtime::Result<()>
-                    where {where_clause},
-                {{
-            "
-        );
-        uwriteln!(self.src, "let mut inst = linker.instance(\"{name}\")?;");
-        for (_, func) in &iface.functions {
-            match func.kind {
-                FunctionKind::Freestanding => {
-                    // Do nothing as freestanding functions can only be part of a resource
-                }
-                FunctionKind::Method(resource)
-                | FunctionKind::Static(resource)
-                | FunctionKind::Constructor(resource) => {
-                    if id == resource {
-                        self.generate_add_function_to_linker(owner, func, "inst");
-                    }
-                }
-            }
-        }
-        uwriteln!(self.src, "Ok(())");
-        uwriteln!(self.src, "}}");
+        //TODO: Only run if the resource is being imported
+        ////This is the resource the implementer should implement the trait for
+        //uwriteln!(self.src, "pub struct Rep{camel} {{");
+        //uwriteln!(self.src, "pub handle: wasmtime::component::ResourceAny,");
+        //for (_, func) in iface.functions.iter() {
+        //    match func.kind {
+        //        FunctionKind::Freestanding => {
+        //            // Do nothing as free standing functions can't be a part of a resource
+        //        }
+        //        FunctionKind::Method(resource)
+        //        | FunctionKind::Static(resource)
+        //        | FunctionKind::Constructor(resource) => {
+        //            // Only generate the function trait signature if the function is part of this resource
+        //            if id == resource {
+        //                uwriteln!(
+        //                    self.src,
+        //                    "{}: wasmtime::component::Func,",
+        //                    func.name.to_snake_case()
+        //                );
+        //            }
+        //        }
+        //    }
+        //}
+        //uwriteln!(self.src, "}}");
+
+
+        //uwriteln!(self.src, 
+        //    "
+        //        impl wasmtime::component::ToHandle for Rep{camel} {{
+        //            fn to_handle(&self) -> wasmtime::component::ResourceAny {{
+        //                self.handle
+        //            }}
+        //        }}
+        //    "
+        //);
+
+        //if self.gen.opts.async_ {
+        //    uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
+        //}
+//
+        //uwriteln!(self.src, "impl {camel} for Rep{camel} {{");
+//
+        //for (_, func) in &iface.functions {
+        //    match func.kind {
+        //        FunctionKind::Freestanding => {
+        //            // Do nothing as freestanding functions can only be part of a resource
+        //        }
+        //        FunctionKind::Method(resource)
+        //        | FunctionKind::Static(resource)
+        //        | FunctionKind::Constructor(resource) => {
+        //            // Only generate, if the function is part of this resource
+        //            if id == resource {
+        //                self.define_rust_guest_import_trait(
+        //                    self.resolve,
+        //                    None,
+        //                    func,
+        //                    iface,
+        //                );
+        //            }
+        //        }
+        //    }
+        //}
+//
+        //uwriteln!(self.src, "}}");
 
         //todo!("#6722")
     }
@@ -1281,6 +1342,26 @@ impl<'a> InterfaceGenerator<'a> {
         let iface = &self.resolve.interfaces[id];
         let owner = TypeOwner::Interface(id);
 
+        let mut resource = false;
+
+        for (_name, func) in iface.functions.iter() {
+            
+            match func.kind {
+                FunctionKind::Freestanding => {},
+                FunctionKind::Method(_)|
+                FunctionKind::Static(_)|
+                FunctionKind::Constructor(_) => {
+                    resource = true;
+                },
+            }
+        } 
+
+        //TODO: Handle multiple imports of a resource
+        //dbg!(&self.gen.opts);
+        if resource { 
+            uwriteln!(self.src, "use super::super::super::ImplScalars;");
+        }
+
         if self.gen.opts.async_ {
             uwriteln!(self.src, "#[wasmtime::component::__internal::async_trait]")
         }
@@ -1292,20 +1373,46 @@ impl<'a> InterfaceGenerator<'a> {
                 FunctionKind::Freestanding => {
                     self.generate_function_trait_sig(owner, func);
                 }
-                FunctionKind::Method(resource)
-                | FunctionKind::Static(resource)
-                | FunctionKind::Constructor(resource) => {
+                _ => {
                     // Do nothing as Static functions, methods and constructors can only be part of a resource
                 }
             }
         }
         uwriteln!(self.src, "}}");
 
-        let where_clause = if self.gen.opts.async_ {
-            "T: Send, U: Host + Send".to_string()
-        } else {
-            "U: Host".to_string()
+        //TODO: Replace with loop to add constraint for each implementation a resource.
+        let resource_traits = if resource { 
+
+            let traits = self.gen.opts.resources.iter()
+                .map(|(_wit_name, impl_name)| format!("wasmtime::component::ResourceTable<{impl_name}>"))
+                .collect::<Vec<String>>()
+                .join(" + ");
+
+            if traits.len() > 0 {
+                Some(traits)
+            } else {
+                None
+            }
+         }
+        else {
+            None
         };
+
+        let where_clause = match (self.gen.opts.async_, resource_traits) {
+            (true, None) => {
+                format!("T: Send, U: Host + Send")
+            },
+            (true, Some(resource_traits)) => {
+                format!("T: {resource_traits} + Send, U: Host + Send")
+            },
+            (false, None) => {
+                "U: Host".to_owned()
+            },
+            (false, Some(resource_traits)) => {
+                format!("T: {resource_traits}, U: Host")
+            },
+        };
+
         uwriteln!(
             self.src,
             "
@@ -1318,18 +1425,24 @@ impl<'a> InterfaceGenerator<'a> {
             "
         );
         uwriteln!(self.src, "let mut inst = linker.instance(\"{name}\")?;");
-        for (_, func) in iface.functions.iter() {
-            match func.kind {
-                FunctionKind::Freestanding => {
-                    self.generate_add_function_to_linker(owner, func, "inst");
-                }
-                FunctionKind::Method(resource)
-                | FunctionKind::Static(resource)
-                | FunctionKind::Constructor(resource) => {
-                    // Do nothing as Static functions, methods and constructors can only be part of a resource
-                }
+
+        if resource { 
+            for (wit_name, impl_name) in self.gen.opts.resources.iter() {
+                uwriteln!(self.src, 
+                    "
+                        inst.resource::<{impl_name}>(\"{wit_name}\", |mut store, rep| {{
+                            store.data_mut().drop_resource(rep);
+                        }})?;
+                    "
+                );
             }
         }
+
+        //TODO: Sort by resource name
+        for (_, func) in iface.functions.iter() {
+            self.generate_add_function_to_linker(owner, func, "inst");
+        }
+
         uwriteln!(self.src, "Ok(())");
         uwriteln!(self.src, "}}");
     }
@@ -1345,6 +1458,7 @@ impl<'a> InterfaceGenerator<'a> {
             },
             func.name
         );
+
         self.generate_guest_import_closure(owner, func);
         uwriteln!(self.src, ")?;")
     }
@@ -1352,6 +1466,7 @@ impl<'a> InterfaceGenerator<'a> {
     fn generate_guest_import_closure(&mut self, owner: TypeOwner, func: &Function) {
         // Generate the closure that's passed to a `Linker`, the final piece of
         // codegen here.
+        //TODO: Remove mut if the state is never changed
         self.src
             .push_str("move |mut caller: wasmtime::StoreContextMut<'_, T>, (");
         for (i, _param) in func.params.iter().enumerate() {
@@ -1359,11 +1474,40 @@ impl<'a> InterfaceGenerator<'a> {
         }
         self.src.push_str(") : (");
         for param in func.params.iter() {
-            // Lift is required to be impled for this type, so we can't use
-            // a borrowed type:
-            self.print_ty(&param.1, TypeMode::Owned);
+
+
+            let resources = self.get_resource_from_ty(&param.1);
+
+            let is_owned_by_current = match (owner, self.current_interface) {
+                (TypeOwner::World(_), None) => false,
+                (TypeOwner::World(world_id), Some(other)) => {
+                    //TODO: Figure out how this should actually be compared
+                    false
+                },
+                (TypeOwner::Interface(_), None) => false,
+                (TypeOwner::Interface(id), Some(other)) => id == other.0,
+                (TypeOwner::None, None) => true,
+                (TypeOwner::None, Some(_)) => false,
+            };
+
+            if !resources.is_empty() && is_owned_by_current
+            {                
+                //TODO: Handle nested types
+                let resource_name = resources.first().unwrap();
+                let resource_impl_name = self.gen.opts.resources
+                    .get(resource_name)
+                    .expect(&format!("resource `{resource_name}` doesn't have an implementation"));
+
+                uwrite!(self.src, "wasmtime::component::Resource<{resource_impl_name}>");
+            } else {
+                // Lift is required to be impled for this type, so we can't use
+                // a borrowed type:
+                self.print_ty(&param.1, TypeMode::Owned);
+            }
+            
             self.src.push_str(", ");
         }
+
         self.src.push_str(") |");
         if self.gen.opts.async_ {
             self.src.push_str(" Box::new(async move { \n");
@@ -1410,16 +1554,77 @@ impl<'a> InterfaceGenerator<'a> {
             );
         }
 
-        self.src.push_str("let host = get(caller.data_mut());\n");
 
-        uwrite!(self.src, "let r = host.{}(", func.name.to_snake_case());
-        for (i, _) in func.params.iter().enumerate() {
-            uwrite!(self.src, "arg{},", i);
-        }
-        if self.gen.opts.async_ {
-            uwrite!(self.src, ").await;\n");
-        } else {
-            uwrite!(self.src, ");\n");
+        let func_name = func.name.to_snake_case();
+
+        //TODO: Change what is passed in depedning on if it's an import or exported resource in arguments
+        //TODO: Handle resources as arguments and it lists, options, results and tuples
+        match func.kind {
+            FunctionKind::Freestanding => {
+                uwriteln!(self.src, "let host = get(caller.data_mut());");
+
+                uwrite!(self.src, "let r = host.{func_name}(");
+                for (i, _) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{i}, ");
+                }
+                if self.gen.opts.async_ {
+                    uwrite!(self.src, ").await;\n");
+                } else {
+                    uwrite!(self.src, ");\n");
+                }
+            },
+            FunctionKind::Method(_) => {
+                //TODO: Change to from `get_resource_mut` to `get_resource` if it's not mutating the state
+                uwriteln!(self.src, "let mut resource = caller.data_mut().get_resource_mut(arg0);");
+
+                uwrite!(self.src, "let r = resource.{func_name}(");
+
+                // Skip the first argument as it's the resource handle which is handled by the trait implementation of `ResourceTable<T>`
+                for (i, _) in func.params.iter().enumerate().skip(1) {
+                    uwrite!(self.src, "arg{i}, ");
+                }
+                if self.gen.opts.async_ {
+                    uwrite!(self.src, ").await;\n");
+                } else {
+                    uwrite!(self.src, ");\n");
+                }
+            },
+            FunctionKind::Static(_) => {
+                let resource_name = func.name[7..].to_string();
+                let resource_impl_name = self.gen.opts.resources
+                    .get(&resource_name)
+                    .expect(&format!("resource `{resource_name}` doesn't have an implementation"));
+
+                uwrite!(self.src, "let r = {resource_impl_name}::{func_name}(");
+                
+                for (i, _) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{i}, ");
+                }
+                if self.gen.opts.async_ {
+                    uwrite!(self.src, ").await;\n");
+                } else {
+                    uwrite!(self.src, ");\n");
+                }
+            },
+            FunctionKind::Constructor(_) => {      
+                let resource_name = func.name[13..].to_string();
+                let resource_impl_name = self.gen.opts.resources
+                    .get(&resource_name)
+                    .expect(&format!("resource `{resource_name}` doesn't have an implementation"));
+
+                uwrite!(self.src, "let resource = {resource_impl_name}::new(");
+
+                for (i, _) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{i},");
+                }
+                if self.gen.opts.async_ {
+                    uwrite!(self.src, ").await;\n");
+                } else {
+                    uwrite!(self.src, ")?;\n");
+                }
+
+                uwrite!(self.src, "let r = caller.data_mut().new_resource(resource);");
+            },
         }
 
         if self.gen.opts.tracing {
@@ -1444,17 +1649,402 @@ impl<'a> InterfaceGenerator<'a> {
                 }}"
             );
         } else if func.results.iter_types().len() == 1 {
-            uwrite!(self.src, "Ok((r?,))\n");
+            match func.kind {
+                FunctionKind::Constructor(_) => {
+                    uwrite!(self.src, "Ok((r,))\n");
+                },
+                _ => {
+                    uwrite!(self.src, "Ok((r?,))\n");
+                },
+            }
+            
         } else {
             uwrite!(self.src, "r\n");
         }
 
         if self.gen.opts.async_ {
             // Need to close Box::new and async block
-            self.src.push_str("})");
+            self.src.push_str("})\n");
         } else {
-            self.src.push_str("}");
+            self.src.push_str("}\n");
         }
+    }
+
+    //fn generate_guest_import_closure(&mut self, owner: TypeOwner, func: &Function) {
+    //    // Generate the closure that's passed to a `Linker`, the final piece of
+    //    // codegen here.
+    //    self.src
+    //        .push_str("move |mut caller: wasmtime::StoreContextMut<'_, T>, (");
+    //    for (i, _param) in func.params.iter().enumerate() {
+    //        uwrite!(self.src, "arg{},", i);
+    //    }
+    //    self.src.push_str(") : (");
+    //    for param in func.params.iter() {
+    //        // Lift is required to be impled for this type, so we can't use
+    //        // a borrowed type:
+    //        self.print_ty(&param.1, TypeMode::Owned);
+    //        self.src.push_str(", ");
+    //    }
+    //    self.src.push_str(") |");
+    //    if self.gen.opts.async_ {
+    //        self.src.push_str(" Box::new(async move { \n");
+    //    } else {
+    //        self.src.push_str(" { \n");
+    //    }
+//
+    //    if self.gen.opts.tracing {
+    //        uwrite!(
+    //            self.src,
+    //            "
+    //               let span = tracing::span!(
+    //                   tracing::Level::TRACE,
+    //                   \"wit-bindgen import\",
+    //                   module = \"{}\",
+    //                   function = \"{}\",
+    //               );
+    //               let _enter = span.enter();
+    //           ",
+    //            match owner {
+    //                TypeOwner::Interface(id) => self.resolve.interfaces[id]
+    //                    .name
+    //                    .as_deref()
+    //                    .unwrap_or("<no module>"),
+    //                TypeOwner::World(id) => &self.resolve.worlds[id].name,
+    //                TypeOwner::None => "<no owner>",
+    //            },
+    //            func.name,
+    //        );
+    //        let mut event_fields = func
+    //            .params
+    //            .iter()
+    //            .enumerate()
+    //            .map(|(i, (name, _ty))| {
+    //                let name = to_rust_ident(&name);
+    //                format!("{name} = tracing::field::debug(&arg{i})")
+    //            })
+    //            .collect::<Vec<String>>();
+    //        event_fields.push(format!("\"call\""));
+    //        uwrite!(
+    //            self.src,
+    //            "tracing::event!(tracing::Level::TRACE, {});\n",
+    //            event_fields.join(", ")
+    //        );
+    //    }
+//
+    //    self.src.push_str("let host = get(caller.data_mut());\n");
+//
+    //    uwrite!(self.src, "let r = host.{}(", func.name.to_snake_case());
+    //    for (i, _) in func.params.iter().enumerate() {
+    //        uwrite!(self.src, "arg{},", i);
+    //    }
+    //    if self.gen.opts.async_ {
+    //        uwrite!(self.src, ").await;\n");
+    //    } else {
+    //        uwrite!(self.src, ");\n");
+    //    }
+//
+    //    if self.gen.opts.tracing {
+    //        uwrite!(
+    //            self.src,
+    //            "tracing::event!(tracing::Level::TRACE, result = tracing::field::debug(&r), \"return\");"
+    //        );
+    //    }
+//
+    //    if self
+    //        .special_case_trappable_error(owner, &func.results)
+    //        .is_some()
+    //    {
+    //        uwrite!(
+    //            self.src,
+    //            "match r {{
+    //                Ok(a) => Ok((Ok(a),)),
+    //                Err(e) => match e.downcast() {{
+    //                    Ok(api_error) => Ok((Err(api_error),)),
+    //                    Err(anyhow_error) => Err(anyhow_error),
+    //                }}
+    //            }}"
+    //        );
+    //    } else if func.results.iter_types().len() == 1 {
+    //        uwrite!(self.src, "Ok((r?,))\n");
+    //    } else {
+    //        uwrite!(self.src, "r\n");
+    //    }
+//
+    //    if self.gen.opts.async_ {
+    //        // Need to close Box::new and async block
+    //        self.src.push_str("})");
+    //    } else {
+    //        self.src.push_str("}");
+    //    }
+    //}
+
+    fn get_resource_from_tyid(&mut self, id: &TypeId) -> Vec<String> {
+        let ty = &self.resolve().types[*id];
+
+        let mut types = Vec::new();
+
+        match &ty.kind {
+            TypeDefKind::Resource => types.push(ty.name.as_ref().unwrap().clone()),
+            TypeDefKind::Handle(h) => {
+                match h {
+                    Handle::Own(id) |
+                    Handle::Borrow(id) => {
+                        types.append(&mut self.get_resource_from_tyid(id));
+                    },
+                }
+            },
+            TypeDefKind::Tuple(t) => {
+                for ty in t.types.iter() {
+                    types.append(&mut self.get_resource_from_ty(&ty));
+                }
+            },
+            TypeDefKind::Option(ty) => {
+                types.append(&mut self.get_resource_from_ty(&ty));
+            },
+            TypeDefKind::Result(r) => {
+                if let Some(ty) = r.ok{
+                    types.append(&mut self.get_resource_from_ty(&ty));
+                }
+
+                if let Some(ty) = r.err{
+                    types.append(&mut self.get_resource_from_ty(&ty));
+                }
+            },
+            TypeDefKind::List(ty) => {
+                types.append(&mut self.get_resource_from_ty(ty));
+            },
+            TypeDefKind::Future(f) => {
+                if let Some(ty) = f.as_ref() {
+                    types.append(&mut self.get_resource_from_ty(&ty));
+                }
+            },
+            TypeDefKind::Stream(s) => {
+                if let Some(ty) = s.element{
+                    types.append(&mut self.get_resource_from_ty(&ty));
+                }
+
+                if let Some(ty) = s.end{
+                    types.append(&mut self.get_resource_from_ty(&ty));
+                }
+            },
+            TypeDefKind::Type(ty) => {
+                types.append(&mut self.get_resource_from_ty(ty));
+
+            },
+            _ => {},
+        }
+
+        types
+    }
+
+    fn get_resource_from_ty(&mut self, ty: &Type) -> Vec<String> {
+        let mut types = Vec::new();
+        match ty {
+            Type::Bool |
+            Type::U8 |
+            Type::U16 |
+            Type::U32 |
+            Type::U64 |
+            Type::S8 |
+            Type::S16 |
+            Type::S32 |
+            Type::S64 |
+            Type::Float32 |
+            Type::Float64 |
+            Type::Char |
+            Type::String => {},
+            Type::Id(id) => {
+                types.append(&mut self.get_resource_from_tyid(id));
+            },
+        }
+
+        types
+    }
+
+    fn generate_resource_function_trait_sig(&mut self, owner: TypeOwner, func: &Function) {
+        self.rustdoc(&func.docs);
+
+        if self.gen.opts.async_ {
+            self.push_str("async ");
+        }
+        self.push_str("fn ");
+        match func.kind {
+            FunctionKind::Freestanding | FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                self.push_str(&to_rust_ident(&func.name));
+            }
+            FunctionKind::Constructor(_) => {
+                self.push_str("new");
+            }
+        }
+
+        self.push_str("<S: wasmtime::AsContextMut>(");
+        match func.kind {
+            FunctionKind::Method(_) | FunctionKind::Static(_) => self.push_str("&self, "),
+            FunctionKind::Freestanding | FunctionKind::Constructor(_) => {}
+        }
+        self.push_str("store: S, ");
+        match func.kind {
+            FunctionKind::Method(_) | FunctionKind::Static(_) => {}
+            FunctionKind::Freestanding | FunctionKind::Constructor(_) => {
+                self.push_str("instance: &wasmtime::component::Instance, ");
+            }
+        }
+
+
+        let mut params: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (name, param) in func.params.iter() {
+
+            let name = to_rust_ident(name);
+            params.insert(name, self.get_resource_from_ty(param));
+        }
+
+        let mut params_string = String::default();
+
+        for (name, param) in func.params.iter() {
+
+            let name = to_rust_ident(name);
+            params_string.push_str(&name);
+            params_string.push_str(": ");
+            self.print_ty(param, TypeMode::Owned);
+            params_string.push_str(",");
+        }
+
+        dbg!(params);
+
+        //for param in params {
+//
+        //}
+
+        self.push_str(")");
+        self.push_str(" -> ");
+
+        if let Some((r, error_typename)) = self.special_case_trappable_error(owner, &func.results) {
+            // Functions which have a single result `result<ok,err>` get special
+            // cased to use the host_wasmtime_rust::Error<err>, making it possible
+            // for them to trap or use `?` to propogate their errors
+            self.push_str("Result<");
+            if let Some(ok) = r.ok {
+                match func.kind {
+                    FunctionKind::Freestanding
+                    | FunctionKind::Method(_)
+                    | FunctionKind::Static(_) => {
+                        self.print_ty(&ok, TypeMode::Owned);
+                    }
+                    FunctionKind::Constructor(_) => {
+                        self.push_str("Self");
+                    }
+                }
+            } else {
+                self.push_str("()");
+            }
+            self.push_str(",");
+            self.push_str(&error_typename);
+            self.push_str(">");
+        } else {
+            // All other functions get their return values wrapped in an wasmtime::Result.
+            // Returning the anyhow::Error case can be used to trap.
+            self.push_str("wasmtime::Result<");
+            match func.kind {
+                FunctionKind::Freestanding | FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                    self.print_result_ty(&func.results, TypeMode::Owned);
+                }
+                FunctionKind::Constructor(_) => {
+                    self.push_str("Self");
+                }
+            }
+
+            self.push_str("> where Self: Sized");
+        }
+
+        self.push_str(";\n");
+    }
+
+    fn generate_export_resource_function_trait_sig(&mut self, owner: TypeOwner, func: &Function) {
+        self.rustdoc(&func.docs);
+
+        if self.gen.opts.async_ {
+            self.push_str("async ");
+        }
+        self.push_str("fn ");
+        match func.kind {
+            FunctionKind::Freestanding | FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                self.push_str(&to_rust_ident(&func.name));
+            }
+            FunctionKind::Constructor(_) => {
+                self.push_str("new");
+            }
+        }
+
+        self.push_str("(");
+        match func.kind {
+            FunctionKind::Method(_) | FunctionKind::Static(_) => self.push_str("&self, "),
+            FunctionKind::Freestanding | FunctionKind::Constructor(_) => {}
+        }
+
+        let mut params: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (name, param) in func.params.iter() {
+
+            let name = to_rust_ident(name);
+            params.insert(name, self.get_resource_from_ty(param));
+        }
+
+        for (name, param) in func.params.iter() {
+
+            let name = to_rust_ident(name);
+            if &name != "self_" {
+                self.push_str(&name);
+                self.push_str(": ");
+                self.print_ty(param, TypeMode::Owned);
+                self.push_str(",");
+            }
+        }
+
+        dbg!(params);
+
+        self.push_str(")");
+        self.push_str(" -> ");
+
+        if let Some((r, error_typename)) = self.special_case_trappable_error(owner, &func.results) {
+            // Functions which have a single result `result<ok,err>` get special
+            // cased to use the host_wasmtime_rust::Error<err>, making it possible
+            // for them to trap or use `?` to propogate their errors
+            self.push_str("Result<");
+            if let Some(ok) = r.ok {
+                match func.kind {
+                    FunctionKind::Freestanding
+                    | FunctionKind::Method(_)
+                    | FunctionKind::Static(_) => {
+                        self.print_ty(&ok, TypeMode::Owned);
+                    }
+                    FunctionKind::Constructor(_) => {
+                        self.push_str("Self");
+                    }
+                }
+            } else {
+                self.push_str("()");
+            }
+            self.push_str(",");
+            self.push_str(&error_typename);
+            self.push_str(">");
+        } else {
+            // All other functions get their return values wrapped in an wasmtime::Result.
+            // Returning the anyhow::Error case can be used to trap.
+            self.push_str("wasmtime::Result<");
+            match func.kind {
+                FunctionKind::Freestanding | FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                    self.print_result_ty(&func.results, TypeMode::Owned);
+                }
+                FunctionKind::Constructor(_) => {
+                    self.push_str("Self");
+                }
+            }
+
+            self.push_str("> where Self: Sized");
+        }
+
+        self.push_str(";\n");
     }
 
     fn generate_function_trait_sig(&mut self, owner: TypeOwner, func: &Function) {
@@ -1522,6 +2112,216 @@ impl<'a> InterfaceGenerator<'a> {
         ret
     }
 
+    fn define_rust_guest_export_trait(
+        &mut self,
+        resolve: &Resolve,
+        ns: Option<&WorldKey>,
+        func: &Function,
+        iface: &Interface,
+    ) {
+        let (async_, async__, await_) = if self.gen.opts.async_ {
+            ("async", "_async", ".await")
+        } else {
+            ("", "", "")
+        };
+
+        self.rustdoc(&func.docs);
+
+        match func.kind {
+            FunctionKind::Freestanding => {}
+            FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                uwrite!(
+                    self.src,
+                    "{async_} fn {}<S: wasmtime::AsContextMut>(&self, mut store: S, ",
+                    func.name.to_snake_case(),
+                );
+                for (i, param) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{}: ", i);
+                    self.print_ty(&param.1, TypeMode::AllBorrowed("'_"));
+                    self.push_str(",");
+                }
+                self.src.push_str(") -> wasmtime::Result<");
+                self.print_result_ty(&func.results, TypeMode::Owned);
+            }
+            FunctionKind::Constructor(_) => {
+                uwrite!(
+                    self.src,
+                    "{async_} fn new<S: wasmtime::AsContextMut>(mut store: S, instance: &wasmtime::component::Instance, "
+                );
+                for (i, param) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{}: ", i);
+                    self.print_ty(&param.1, TypeMode::AllBorrowed("'_"));
+                    self.push_str(",");
+                }
+                self.src.push_str(") -> wasmtime::Result<Self");
+            }
+        }
+
+        if self.gen.opts.async_ {
+            self.src
+                .push_str("> where <S as wasmtime::AsContext>::Data: Send, Self: Sized{\n");
+        } else {
+            self.src.push_str("> {\n");
+        }
+
+        if self.gen.opts.tracing {
+            let ns = match ns {
+                Some(key) => resolve.name_world_key(key),
+                None => "default".to_string(),
+            };
+            self.src.push_str(&format!(
+                "
+                   let span = tracing::span!(
+                       tracing::Level::TRACE,
+                       \"wit-bindgen export\",
+                       module = \"{ns}\",
+                       function = \"{}\",
+                   );
+                   let _enter = span.enter();
+               ",
+                func.name,
+            ));
+        }
+
+        let mut fields = Vec::new();
+        let extractions = match func.kind {
+            FunctionKind::Freestanding | FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                String::default()
+            }
+            FunctionKind::Constructor(_) => {
+                //let name = "example:component/backend";
+                let (_, name, _) = self.current_interface.unwrap();
+                dbg!(&resolve.package_names);
+                let name = resolve.name_world_key(name);
+                let mut s = format!(
+                    "
+                       let mut exports = instance.exports(store.as_context_mut());
+                       let mut __exports = exports.instance(\"{name}\")
+                            .ok_or_else(|| anyhow::anyhow!(\"exported instance `{name}` not present\"))?;
+                   "
+                   
+                );
+                //self.src.push_str(&format!(
+                //    "
+                //       let mut exports = instance.exports(store.as_context_mut());
+                //       let mut __exports = exports.root();
+                //   "
+                //));
+
+                for (_, func) in iface.functions.iter() {
+                    match func.kind {
+                        FunctionKind::Freestanding => {}
+                        FunctionKind::Method(_)
+                        | FunctionKind::Static(_)
+                        | FunctionKind::Constructor(_) => {
+                            let (name, getter) = self.extract_typed_function(func);
+
+                            uwriteln!(s, "let {name} = {getter};");
+                            fields.push(name);
+                        }
+                    }
+                }
+                s
+            }
+        };
+        let names = fields.join(", ");
+
+        self.src.push_str(&format!(
+            "
+                    let ({names}) = {{
+                        {extractions}
+                        ({names})
+                    }};
+                   "
+        ));
+
+        self.src.push_str("let callee = unsafe {\n");
+        self.src.push_str("wasmtime::component::TypedFunc::<(");
+        for (_, ty) in func.params.iter() {
+            self.print_ty(ty, TypeMode::AllBorrowed("'_"));
+            self.push_str(", ");
+        }
+        self.src.push_str("), (");
+        for ty in func.results.iter_types() {
+            self.print_ty(ty, TypeMode::Owned);
+            self.push_str(", ");
+        }
+
+        match func.kind {
+            FunctionKind::Freestanding | FunctionKind::Method(_) | FunctionKind::Static(_) => {
+                uwriteln!(
+                    self.src,
+                    ")>::new_unchecked(self.{})",
+                    func.name.to_snake_case()
+                );
+            }
+            FunctionKind::Constructor(_) => {
+                uwriteln!(self.src, ")>::new_unchecked({})", func.name.to_snake_case());
+            }
+        }
+
+        self.src.push_str("};\n");
+        self.src.push_str("let (");
+        for (i, _) in func.results.iter_types().enumerate() {
+            uwrite!(self.src, "ret{},", i);
+        }
+
+        match func.kind {
+            FunctionKind::Constructor(_) => {
+                uwrite!(
+                    self.src,
+                    ") = callee.call{async__}(store.as_context_mut(), ("
+                );
+                for (i, _) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{}, ", i);
+                }
+                uwriteln!(self.src, ")){await_}?;");
+
+                uwriteln!(
+                    self.src,
+                    "callee.post_return{async__}(store.as_context_mut()){await_}?;"
+                );
+
+                uwriteln!(self.src, "Ok(Self {{");
+                uwriteln!(self.src, "handle: ret0,");
+                for name in fields {
+                    uwriteln!(self.src, "{name},");
+                }
+                uwriteln!(self.src, "}})");
+            }
+            _ => {
+                uwrite!(
+                    self.src,
+                    ") = callee.call{async__}(store.as_context_mut(), ("
+                );
+                for (i, _) in func.params.iter().enumerate() {
+                    uwrite!(self.src, "arg{}, ", i);
+                }
+                uwriteln!(self.src, ")){await_}?;");
+
+                uwriteln!(
+                    self.src,
+                    "callee.post_return{async__}(store.as_context_mut()){await_}?;"
+                );
+
+                self.src.push_str("Ok(");
+                if func.results.iter_types().len() == 1 {
+                    self.src.push_str("ret0");
+                } else {
+                    self.src.push_str("(");
+                    for (i, _) in func.results.iter_types().enumerate() {
+                        uwrite!(self.src, "ret{},", i);
+                    }
+                    self.src.push_str(")");
+                }
+                self.src.push_str(")\n");
+            }
+        }
+
+        // End function body
+        self.src.push_str("}\n");
+    }
+
     fn define_rust_guest_export(
         &mut self,
         resolve: &Resolve,
@@ -1534,15 +2334,65 @@ impl<'a> InterfaceGenerator<'a> {
             ("", "", "")
         };
 
+        let params: Vec<Option<Vec<String>>> = {
+            func.params.iter().map(|param| {
+                let resources = self.get_resource_from_ty(&param.1);
+
+                if resources.is_empty() {
+                    None
+                } else {
+                    Some(resources)
+                }
+            }).collect()
+        };
+
+        let resources: Vec<Vec<String>> = params.clone().into_iter().flatten().collect();
+
         self.rustdoc(&func.docs);
-        uwrite!(
-            self.src,
-            "pub {async_} fn call_{}<S: wasmtime::AsContextMut>(&self, mut store: S, ",
-            func.name.to_snake_case(),
-        );
+        uwrite!(self.src, "pub {async_} fn call_{}<", func.name.to_snake_case());
+
+        let mut args_map = HashMap::new();
+
+        if resources.is_empty() {
+            uwrite!(self.src, "S: wasmtime::AsContextMut>(&self, mut store: S, ",);
+        } else {
+            let mut t = String::default();
+
+            for (i, resource) in resources.iter().enumerate() {
+                let resource_trait_name = resource.first().unwrap().to_upper_camel_case();
+
+                let arg_name = format!("R{i}");
+
+                uwriteln!(self.src,"{arg_name}: {resource_trait_name} + 'static,");
+                uwrite!(t, "wasmtime::component::ResourceTable<{arg_name}> ");
+
+                args_map.insert(resource_trait_name.clone(), arg_name);
+
+                if i != resources.len() - 1 {
+                    uwrite!(t, "+ ");
+                }    
+            }
+            
+            uwriteln!(self.src,"T: {t},");
+
+            uwriteln!(self.src,"S: wasmtime::AsContextMut<Data = T>,>(&self, mut store: S, ");
+        }
+
         for (i, param) in func.params.iter().enumerate() {
-            uwrite!(self.src, "arg{}: ", i);
-            self.print_ty(&param.1, TypeMode::AllBorrowed("'_"));
+            uwrite!(self.src, "arg{i}: ");
+
+            match params.get(i).unwrap() {
+                Some(resources) => {
+                    //TODO: Handle nested types
+                    let resource_trait_name = resources.first().unwrap().to_upper_camel_case();
+                
+                    let arg_name = args_map.get(&resource_trait_name).expect("no argument name for resource trait name");
+                
+                    uwrite!(self.src, "{arg_name}");
+                },
+                None => self.print_ty(&param.1, TypeMode::AllBorrowed("'_")),
+            }
+
             self.push_str(",");
         }
         self.src.push_str(") -> wasmtime::Result<");
@@ -1576,10 +2426,25 @@ impl<'a> InterfaceGenerator<'a> {
 
         self.src.push_str("let callee = unsafe {\n");
         self.src.push_str("wasmtime::component::TypedFunc::<(");
-        for (_, ty) in func.params.iter() {
-            self.print_ty(ty, TypeMode::AllBorrowed("'_"));
-            self.push_str(", ");
+
+        dbg!(&params);
+
+        for (i, param) in func.params.iter().enumerate() {
+            match params.get(i).unwrap() {
+                Some(resources) => {
+                    //TODO: Handle nested types
+                    let resource_trait_name = resources.first().unwrap().to_upper_camel_case();
+                
+                    let arg_name = args_map.get(&resource_trait_name).expect("no argument name for resource trait name");
+                
+                    uwrite!(self.src, "wasmtime::component::Resource<{arg_name}>");
+                },
+                None => self.print_ty(&param.1, TypeMode::AllBorrowed("'_")),
+            }
+
+            self.push_str(",");
         }
+
         self.src.push_str("), (");
         for ty in func.results.iter_types() {
             self.print_ty(ty, TypeMode::Owned);
@@ -1591,6 +2456,13 @@ impl<'a> InterfaceGenerator<'a> {
             func.name.to_snake_case()
         );
         self.src.push_str("};\n");
+
+        for (i, param) in params.iter().enumerate() {
+            if let Some(_) = param {
+                uwrite!(self.src, "let arg{i} = store.as_context_mut().data_mut().new_resource(arg{i});");
+            }
+        }
+
         self.src.push_str("let (");
         for (i, _) in func.results.iter_types().enumerate() {
             uwrite!(self.src, "ret{},", i);

@@ -92,7 +92,6 @@ pub trait RustGenerator<'a> {
                 if let Some(path) = self.path_to_interface(id) {
                     self.push_str(&path);
                     self.push_str("::");
-                    dbg!(path);
                 }
             }
             self.push_str(&name);
@@ -189,14 +188,18 @@ pub trait RustGenerator<'a> {
                 self.push_str(">");
             }
             TypeDefKind::Handle(Handle::Own(ty)) => {
-                self.push_str("wasmtime::component::Resource<");
-                self.print_tyid(*ty, mode);
-                self.push_str("Impl>");
+                //TODO: Clean up how resource types are outputted
+                self.push_str("wasmtime::component::ResourceAny");
+                //self.push_str("wasmtime::component::Resource<Rep");
+                //self.print_tyid(*ty, mode);
+                //self.push_str(">");
             }
             TypeDefKind::Handle(Handle::Borrow(ty)) => {
-                self.push_str("wasmtime::component::Resource<");
-                self.print_tyid(*ty, mode);
-                self.push_str("Impl>");
+                //TODO: Clean up how resource types are outputted
+                self.push_str("wasmtime::component::ResourceAny");
+                //self.push_str("wasmtime::component::Resource<Rep");
+                //self.print_tyid(*ty, mode);
+                //self.push_str(">");
             }
             TypeDefKind::Type(t) => self.print_ty(t, mode),
             TypeDefKind::Unknown => unreachable!(),

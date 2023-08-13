@@ -100,6 +100,7 @@ impl Parse for Config {
                         opts.only_interfaces = true;
                     }
                     Opt::With(val) => opts.with.extend(val),
+                    Opt::Resources(val) => opts.resources.extend(val),
                 }
             }
         } else {
@@ -171,6 +172,7 @@ mod kw {
     syn::custom_keyword!(ownership);
     syn::custom_keyword!(interfaces);
     syn::custom_keyword!(with);
+    syn::custom_keyword!(resources);
 }
 
 enum Opt {
@@ -183,6 +185,7 @@ enum Opt {
     Ownership(Ownership),
     Interfaces(syn::LitStr),
     With(HashMap<String, String>),
+    Resources(HashMap<String, String>),
 }
 
 impl Parse for Opt {
@@ -275,6 +278,14 @@ impl Parse for Opt {
             let fields: Punctuated<(String, String), Token![,]> =
                 contents.parse_terminated(with_field_parse, Token![,])?;
             Ok(Opt::With(HashMap::from_iter(fields.into_iter())))
+        } else if l.peek(kw::resources) {
+            input.parse::<kw::resources>()?;
+            input.parse::<Token![:]>()?;
+            let contents;
+            let _lbrace = braced!(contents in input);
+            let fields: Punctuated<(String, String), Token![,]> =
+                contents.parse_terminated(with_field_parse, Token![,])?;
+            Ok(Opt::Resources(HashMap::from_iter(fields.into_iter())))
         } else {
             Err(l.error())
         }
